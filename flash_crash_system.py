@@ -194,27 +194,39 @@ def build_sequences(
 
 
 class TemporalTransformer(nn.Module):
-    def __init__(self, dim: int, nhead: int = 4, layers: int = 2):
+    def __init__(
+        self,
+        input_dim: int,
+        model_dim: int = 32,
+        nhead: int = 4,
+        layers: int = 2,
+    ):
         super().__init__()
+
+        if model_dim % nhead != 0:
+            raise ValueError("model_dim must be divisible by nhead")
+
+        self.input_proj = nn.Linear(input_dim, model_dim)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim,
+            d_model=model_dim,
             nhead=nhead,
             batch_first=True,
-            dim_feedforward=dim * 2,
+            dim_feedforward=model_dim * 2,
             dropout=0.1,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_proj(x)
         encoded = self.encoder(x)
         return encoded[:, -1, :]
 
 
 class GraphTemporalCrashModel(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 64):
+    def __init__(self, in_dim: int, hidden_dim: int = 64, temporal_dim: int = 32):
         super().__init__()
-        self.temporal = TemporalTransformer(in_dim)
-        self.gat1 = GATConv(in_channels=in_dim, out_channels=hidden_dim, heads=1)
+        self.temporal = TemporalTransformer(input_dim=in_dim, model_dim=temporal_dim, nhead=4)
+        self.gat1 = GATConv(in_channels=temporal_dim, out_channels=hidden_dim, heads=1)
         self.gat2 = GATConv(in_channels=hidden_dim, out_channels=hidden_dim, heads=1)
         self.out = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
 
@@ -223,7 +235,7 @@ class GraphTemporalCrashModel(nn.Module):
         batch_size, num_stocks, seq_len, in_dim = x.shape
         reshaped = x.reshape(batch_size * num_stocks, seq_len, in_dim)
         temporal_emb = self.temporal(reshaped)
-        temporal_emb = temporal_emb.reshape(batch_size, num_stocks, in_dim)
+        temporal_emb = temporal_emb.reshape(batch_size, num_stocks, -1)
 
         outputs = []
         for b in range(batch_size):
