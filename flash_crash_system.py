@@ -1,16 +1,20 @@
 """Advanced Flash Crash Early Warning System.
 
-Includes:
-- Agent-based flash crash simulation
-- Multi-stock data ingestion (NIFTY-oriented tickers)
-- Order-book style microstructure features
-- Cross-stock contagion graph with GAT
-- Temporal Transformer for pre-crash prediction
+Phase-1 baseline upgrades included:
+- Reproducibility controls (global seed)
+- Train/validation/test split
+- Imbalance-aware training via BCEWithLogitsLoss(pos_weight)
+- Validation threshold tuning for F1
+- Metrics + config logging and checkpoint saving
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import random
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -18,7 +22,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import yfinance as yf
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    classification_report,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 from torch_geometric.nn import GATConv
@@ -49,6 +58,22 @@ class Config:
     epochs: int = 10
     edge_corr_threshold: float = 0.60
     precrash_horizon_steps: int = 2
+    train_ratio: float = 0.70
+    val_ratio: float = 0.15
+    seed: int = 42
+    threshold_min: float = 0.10
+    threshold_max: float = 0.90
+    threshold_steps: int = 17
+    output_root: str = "results"
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class MarketSimulator:
@@ -102,7 +127,7 @@ class MarketSimulator:
             prices.append(price)
 
             if t > 50 and short_vol > 0.03 and self.rng.random() < 0.02:
-                price *= (1.0 - self.rng.uniform(0.04, 0.10))
+                price *= 1.0 - self.rng.uniform(0.04, 0.10)
                 prices[-1] = price
 
         df = pd.DataFrame({"Close": prices})
@@ -228,7 +253,7 @@ class GraphTemporalCrashModel(nn.Module):
         self.temporal = TemporalTransformer(input_dim=in_dim, model_dim=temporal_dim, nhead=4)
         self.gat1 = GATConv(in_channels=temporal_dim, out_channels=hidden_dim, heads=1)
         self.gat2 = GATConv(in_channels=hidden_dim, out_channels=hidden_dim, heads=1)
-        self.out = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+        self.out = nn.Linear(hidden_dim, 1)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         # x shape: [batch, num_stocks, seq_len, in_dim]
@@ -246,43 +271,136 @@ class GraphTemporalCrashModel(nn.Module):
         return torch.stack(outputs, dim=0)
 
 
-def train_model(model: nn.Module, loader: DataLoader, edge_index: torch.Tensor, cfg: Config) -> None:
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    criterion = nn.BCELoss()
-
-    model.train()
-    for epoch in range(cfg.epochs):
-        total = 0.0
-        for xb, yb in loader:
-            optimizer.zero_grad()
-            pred = model(xb, edge_index)
-            loss = criterion(pred, yb)
-            loss.backward()
-            optimizer.step()
-            total += float(loss.item())
-        print(f"epoch={epoch + 1} loss={total:.4f}")
+def split_indices(n: int, train_ratio: float, val_ratio: float) -> Tuple[slice, slice, slice]:
+    train_end = int(n * train_ratio)
+    val_end = int(n * (train_ratio + val_ratio))
+    return slice(0, train_end), slice(train_end, val_end), slice(val_end, n)
 
 
-def evaluate_model(model: nn.Module, loader: DataLoader, edge_index: torch.Tensor) -> None:
+def compute_pos_weight(y_train: torch.Tensor) -> torch.Tensor:
+    positives = y_train.sum().item()
+    negatives = y_train.numel() - positives
+    if positives <= 0:
+        return torch.tensor(1.0)
+    return torch.tensor(max(negatives / positives, 1.0), dtype=torch.float32)
+
+
+def collect_predictions(model: nn.Module, loader: DataLoader, edge_index: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
     y_true, y_prob = [], []
     with torch.no_grad():
         for xb, yb in loader:
-            prob = model(xb, edge_index)
+            logits = model(xb, edge_index)
+            probs = torch.sigmoid(logits)
             y_true.extend(yb.numpy().ravel().tolist())
-            y_prob.extend(prob.numpy().ravel().tolist())
+            y_prob.extend(probs.numpy().ravel().tolist())
+    return np.array(y_true).astype(int), np.array(y_prob)
 
-    y_true_np = np.array(y_true).astype(int)
-    y_prob_np = np.array(y_prob)
-    y_pred_np = (y_prob_np > 0.70).astype(int)
 
-    print(classification_report(y_true_np, y_pred_np, zero_division=0))
-    if len(np.unique(y_true_np)) > 1:
-        print("ROC-AUC:", roc_auc_score(y_true_np, y_prob_np))
+def metrics_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
+    y_pred = (y_prob >= threshold).astype(int)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", zero_division=0
+    )
+    metrics: Dict[str, float] = {
+        "threshold": float(threshold),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+    }
+    if len(np.unique(y_true)) > 1:
+        metrics["roc_auc"] = float(roc_auc_score(y_true, y_prob))
+        metrics["pr_auc"] = float(average_precision_score(y_true, y_prob))
+    return metrics
+
+
+def tune_threshold(y_true: np.ndarray, y_prob: np.ndarray, cfg: Config) -> Tuple[float, Dict[str, float]]:
+    grid = np.linspace(cfg.threshold_min, cfg.threshold_max, cfg.threshold_steps)
+    best_thr = 0.5
+    best = {"f1": -1.0}
+    for thr in grid:
+        cur = metrics_at_threshold(y_true, y_prob, float(thr))
+        if cur["f1"] > best["f1"]:
+            best_thr, best = float(thr), cur
+    return best_thr, best
+
+
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    edge_index: torch.Tensor,
+    cfg: Config,
+    output_dir: Path,
+) -> Dict[str, object]:
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    y_train_full = np.concatenate([yb.numpy().ravel() for _, yb in train_loader])
+    pos_weight = compute_pos_weight(torch.tensor(y_train_full, dtype=torch.float32))
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    best = {"epoch": -1, "f1": -1.0, "threshold": 0.5}
+    history = []
+
+    for epoch in range(cfg.epochs):
+        model.train()
+        total = 0.0
+        for xb, yb in train_loader:
+            optimizer.zero_grad()
+            logits = model(xb, edge_index)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+            total += float(loss.item())
+
+        y_val_true, y_val_prob = collect_predictions(model, val_loader, edge_index)
+        tuned_thr, val_metrics = tune_threshold(y_val_true, y_val_prob, cfg)
+        epoch_log = {
+            "epoch": epoch + 1,
+            "train_loss": total,
+            "val_metrics": val_metrics,
+        }
+        history.append(epoch_log)
+        print(
+            f"epoch={epoch + 1} loss={total:.4f} "
+            f"val_f1={val_metrics['f1']:.4f} val_thr={tuned_thr:.2f}"
+        )
+
+        if val_metrics["f1"] > best["f1"]:
+            best = {"epoch": epoch + 1, "f1": val_metrics["f1"], "threshold": tuned_thr}
+            torch.save(model.state_dict(), output_dir / "best_model.pt")
+
+    return {"history": history, "best": best, "pos_weight": float(pos_weight.item())}
+
+
+def evaluate_model(
+    model: nn.Module,
+    test_loader: DataLoader,
+    edge_index: torch.Tensor,
+    threshold: float,
+) -> Dict[str, object]:
+    y_true, y_prob = collect_predictions(model, test_loader, edge_index)
+    y_pred = (y_prob >= threshold).astype(int)
+
+    print(classification_report(y_true, y_pred, zero_division=0))
+    metrics = metrics_at_threshold(y_true, y_prob, threshold)
+    if "roc_auc" in metrics:
+        print("ROC-AUC:", metrics["roc_auc"])
+        print("PR-AUC:", metrics["pr_auc"])
+    return {
+        "metrics": metrics,
+        "classification_report": classification_report(y_true, y_pred, zero_division=0, output_dict=True),
+    }
 
 
 def run_pipeline(use_simulator: bool = True) -> None:
     cfg = Config()
+    set_global_seed(cfg.seed)
+
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = Path(cfg.output_root) / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     feature_cols = [
         "return",
         "volatility",
@@ -294,7 +412,7 @@ def run_pipeline(use_simulator: bool = True) -> None:
     ]
 
     if use_simulator:
-        simulator = MarketSimulator()
+        simulator = MarketSimulator(seed=cfg.seed)
         raw_map = {
             ticker: simulator.simulate(initial_price=100 + i * 25)
             for i, ticker in enumerate(NIFTY_50_BANK_CORE)
@@ -307,14 +425,22 @@ def run_pipeline(use_simulator: bool = True) -> None:
             interval=cfg.interval,
         )
 
+    if not raw_map:
+        raise RuntimeError("No market data available. Check symbols/date range or network access.")
+
     feature_map: Dict[str, pd.DataFrame] = {}
     for ticker, df in raw_map.items():
         feat = compute_microstructure_features(df)
         feat = add_precrash_labels(feat, horizon_steps=cfg.precrash_horizon_steps)
-        feature_map[ticker] = feat
+        if not feat.empty:
+            feature_map[ticker] = feat
 
-    stocks = list(feature_map.keys())
+    if len(feature_map) < 2:
+        raise RuntimeError("Need at least 2 non-empty stock series to build a cross-stock graph.")
+
     x, y = build_sequences(feature_map, feature_cols, seq_len=cfg.seq_len)
+    if len(x) < 10:
+        raise RuntimeError("Not enough sequence samples after feature engineering.")
 
     scaler = StandardScaler()
     b, n, t, f = x.shape
@@ -324,16 +450,40 @@ def run_pipeline(use_simulator: bool = True) -> None:
     xb = torch.tensor(x_scaled, dtype=torch.float32)
     yb = torch.tensor(y, dtype=torch.float32)
 
-    split = int(0.8 * len(xb))
-    train_set = TensorDataset(xb[:split], yb[:split])
-    test_set = TensorDataset(xb[split:], yb[split:])
+    tr, va, te = split_indices(len(xb), cfg.train_ratio, cfg.val_ratio)
+    train_set = TensorDataset(xb[tr], yb[tr])
+    val_set = TensorDataset(xb[va], yb[va])
+    test_set = TensorDataset(xb[te], yb[te])
 
     train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False)
     test_loader = DataLoader(test_set, batch_size=cfg.batch_size, shuffle=False)
 
     model = GraphTemporalCrashModel(in_dim=f, hidden_dim=64)
-    train_model(model, train_loader, edge_index, cfg)
-    evaluate_model(model, test_loader, edge_index)
+    train_artifacts = train_model(model, train_loader, val_loader, edge_index, cfg, output_dir)
+
+    best_path = output_dir / "best_model.pt"
+    if best_path.exists():
+        model.load_state_dict(torch.load(best_path, map_location="cpu"))
+
+    evaluation = evaluate_model(
+        model,
+        test_loader,
+        edge_index,
+        threshold=float(train_artifacts["best"]["threshold"]),
+    )
+
+    summary = {
+        "config": asdict(cfg),
+        "num_stocks": len(feature_map),
+        "num_sequences": int(len(x)),
+        "train_artifacts": train_artifacts,
+        "test": evaluation,
+    }
+    with open(output_dir / "run_summary.json", "w", encoding="utf-8") as f_out:
+        json.dump(summary, f_out, indent=2)
+
+    print(f"Saved artifacts to: {output_dir}")
 
 
 if __name__ == "__main__":
