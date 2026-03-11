@@ -39,3 +39,21 @@ This project now automatically:
 
 You can control this via `Config` fields in `flash_crash_system.py`:
 `auto_adjust_intraday_start`, `fallback_to_daily_on_failure`, and `fallback_interval`.
+
+
+## Troubleshooting
+
+If you see `ModuleNotFoundError: No module named "numpy"`, install dependencies in a virtual environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Then run:
+
+```bash
+python flash_crash_system.py
+```
