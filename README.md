@@ -28,3 +28,14 @@ Set `run_pipeline(use_simulator=False)` inside `flash_crash_system.py` to use Ya
 - Checkpointing (`best_model.pt`) and run summary logging (`run_summary.json`)
 
 Artifacts are saved in timestamped folders under `results/`.
+
+## Yahoo intraday data note
+
+Yahoo limits intraday history (for example `5m` is typically limited to ~60 days).
+This project now automatically:
+
+- adjusts `start` to the maximum supported lookback for intraday intervals, and
+- falls back to `1d` data if intraday download returns empty (configurable).
+
+You can control this via `Config` fields in `flash_crash_system.py`:
+`auto_adjust_intraday_start`, `fallback_to_daily_on_failure`, and `fallback_interval`.

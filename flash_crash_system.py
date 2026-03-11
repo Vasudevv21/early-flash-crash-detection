@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -52,6 +52,9 @@ class Config:
     start: str = "2020-01-01"
     end: str = "2024-01-01"
     interval: str = "5m"
+    auto_adjust_intraday_start: bool = True
+    fallback_to_daily_on_failure: bool = True
+    fallback_interval: str = "1d"
     seq_len: int = 20
     batch_size: int = 128
     lr: float = 1e-3
@@ -141,13 +144,57 @@ class MarketSimulator:
 
 
 def download_multi_stock_data(
-    tickers: List[str], start: str, end: str, interval: str
+    tickers: List[str],
+    start: str,
+    end: str,
+    interval: str,
+    auto_adjust_intraday_start: bool = True,
+    fallback_to_daily_on_failure: bool = True,
+    fallback_interval: str = "1d",
 ) -> Dict[str, pd.DataFrame]:
     data: Dict[str, pd.DataFrame] = {}
+
+    intraday_limits_days = {"1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60, "60m": 730, "90m": 60}
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+
+    request_start = start_ts
+    request_end = end_ts
+    if interval in intraday_limits_days and auto_adjust_intraday_start:
+        max_lookback = timedelta(days=intraday_limits_days[interval] - 1)
+        min_allowed_start = end_ts - max_lookback
+        if start_ts < min_allowed_start:
+            request_start = min_allowed_start
+            print(
+                f"[data] interval={interval} supports limited history on Yahoo. "
+                f"Auto-adjusting start from {start_ts.date()} to {request_start.date()}."
+            )
+
     for ticker in tickers:
-        df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
+        df = yf.download(
+            ticker,
+            start=request_start.strftime("%Y-%m-%d"),
+            end=request_end.strftime("%Y-%m-%d"),
+            interval=interval,
+            progress=False,
+        )
+
+        if df.empty and fallback_to_daily_on_failure and interval in intraday_limits_days:
+            print(
+                f"[data] {ticker} returned empty for interval={interval}. "
+                f"Falling back to interval={fallback_interval} for requested range."
+            )
+            df = yf.download(
+                ticker,
+                start=start_ts.strftime("%Y-%m-%d"),
+                end=end_ts.strftime("%Y-%m-%d"),
+                interval=fallback_interval,
+                progress=False,
+            )
+
         if not df.empty:
             data[ticker] = df.dropna().copy()
+
     return data
 
 
@@ -423,10 +470,16 @@ def run_pipeline(use_simulator: bool = True) -> None:
             start=cfg.start,
             end=cfg.end,
             interval=cfg.interval,
+            auto_adjust_intraday_start=cfg.auto_adjust_intraday_start,
+            fallback_to_daily_on_failure=cfg.fallback_to_daily_on_failure,
+            fallback_interval=cfg.fallback_interval,
         )
 
     if not raw_map:
-        raise RuntimeError("No market data available. Check symbols/date range or network access.")
+        raise RuntimeError(
+            "No market data available. For Yahoo intraday data, use recent dates (<=60 days for 5m) "
+            "or allow daily fallback via config."
+        )
 
     feature_map: Dict[str, pd.DataFrame] = {}
     for ticker, df in raw_map.items():
