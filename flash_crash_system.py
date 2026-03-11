@@ -318,6 +318,18 @@ class GraphTemporalCrashModel(nn.Module):
         return torch.stack(outputs, dim=0)
 
 
+
+
+def ensure_label_shape(yb: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    """Align label tensor shape with model logits for BCE losses."""
+    if yb.shape == logits.shape:
+        return yb
+    if yb.ndim == logits.ndim + 1 and yb.shape[-1] == 1:
+        yb = yb.squeeze(-1)
+    if yb.shape != logits.shape:
+        raise ValueError(f"Label shape {tuple(yb.shape)} does not match logits shape {tuple(logits.shape)}")
+    return yb
+
 def split_indices(n: int, train_ratio: float, val_ratio: float) -> Tuple[slice, slice, slice]:
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
@@ -338,6 +350,7 @@ def collect_predictions(model: nn.Module, loader: DataLoader, edge_index: torch.
     with torch.no_grad():
         for xb, yb in loader:
             logits = model(xb, edge_index)
+            yb = ensure_label_shape(yb, logits)
             probs = torch.sigmoid(logits)
             y_true.extend(yb.numpy().ravel().tolist())
             y_prob.extend(probs.numpy().ravel().tolist())
@@ -395,6 +408,7 @@ def train_model(
         for xb, yb in train_loader:
             optimizer.zero_grad()
             logits = model(xb, edge_index)
+            yb = ensure_label_shape(yb, logits)
             loss = criterion(logits, yb)
             loss.backward()
             optimizer.step()
