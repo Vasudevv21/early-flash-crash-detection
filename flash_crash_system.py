@@ -357,6 +357,69 @@ def collect_predictions(model: nn.Module, loader: DataLoader, edge_index: torch.
     return np.array(y_true).astype(int), np.array(y_prob)
 
 
+
+
+def build_probability_diagnostics(
+    y_true: np.ndarray, y_prob: np.ndarray, bins: int = 20
+) -> Dict[str, object]:
+    """Summarize probability distributions by class and estimate overlap."""
+
+    edges = np.linspace(0.0, 1.0, bins + 1)
+
+    def class_summary(label: int) -> Dict[str, object]:
+        vals = y_prob[y_true == label]
+        if vals.size == 0:
+            return {
+                "count": 0,
+                "mean": None,
+                "std": None,
+                "q05": None,
+                "q25": None,
+                "q50": None,
+                "q75": None,
+                "q95": None,
+                "histogram": [0.0] * bins,
+            }
+
+        hist, _ = np.histogram(vals, bins=edges, density=True)
+        return {
+            "count": int(vals.size),
+            "mean": float(np.mean(vals)),
+            "std": float(np.std(vals)),
+            "q05": float(np.quantile(vals, 0.05)),
+            "q25": float(np.quantile(vals, 0.25)),
+            "q50": float(np.quantile(vals, 0.50)),
+            "q75": float(np.quantile(vals, 0.75)),
+            "q95": float(np.quantile(vals, 0.95)),
+            "histogram": [float(x) for x in hist.tolist()],
+        }
+
+    c0 = class_summary(0)
+    c1 = class_summary(1)
+
+    overlap = None
+    if c0["count"] > 0 and c1["count"] > 0:
+        h0 = np.array(c0["histogram"], dtype=np.float64)
+        h1 = np.array(c1["histogram"], dtype=np.float64)
+        # overlap coefficient over equal-width bins in [0, 1]
+        bin_width = 1.0 / bins
+        overlap = float(np.sum(np.minimum(h0, h1)) * bin_width)
+
+    recommendation = (
+        "Strong overlap between class distributions; prioritize stronger event labels, "
+        "higher-quality intraday data (avoid daily fallback), and richer microstructure features."
+        if overlap is not None and overlap >= 0.70
+        else "Class distributions show moderate/low overlap; model/threshold tuning may still help."
+    )
+
+    return {
+        "bin_edges": [float(x) for x in edges.tolist()],
+        "class_0": c0,
+        "class_1": c1,
+        "overlap_coefficient": overlap,
+        "recommendation": recommendation,
+    }
+
 def metrics_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
     y_pred = (y_prob >= threshold).astype(int)
     precision, recall, f1, _ = precision_recall_fscore_support(
@@ -400,6 +463,7 @@ def train_model(
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     best = {"epoch": -1, "f1": -1.0, "threshold": 0.5}
+    best_val_diag: Dict[str, object] = {}
     history = []
 
     for epoch in range(cfg.epochs):
@@ -415,23 +479,43 @@ def train_model(
             total += float(loss.item())
 
         y_val_true, y_val_prob = collect_predictions(model, val_loader, edge_index)
+        val_diag = build_probability_diagnostics(y_val_true, y_val_prob, bins=20)
         tuned_thr, val_metrics = tune_threshold(y_val_true, y_val_prob, cfg)
         epoch_log = {
             "epoch": epoch + 1,
             "train_loss": total,
             "val_metrics": val_metrics,
+            "val_overlap_coefficient": val_diag.get("overlap_coefficient"),
         }
         history.append(epoch_log)
         print(
             f"epoch={epoch + 1} loss={total:.4f} "
-            f"val_f1={val_metrics['f1']:.4f} val_thr={tuned_thr:.2f}"
+            f"val_f1={val_metrics['f1']:.4f} val_thr={tuned_thr:.2f} "
+            f"val_overlap={val_diag.get('overlap_coefficient')}"
         )
 
         if val_metrics["f1"] > best["f1"]:
             best = {"epoch": epoch + 1, "f1": val_metrics["f1"], "threshold": tuned_thr}
+            best_val_diag = val_diag
             torch.save(model.state_dict(), output_dir / "best_model.pt")
 
-    return {"history": history, "best": best, "pos_weight": float(pos_weight.item())}
+    with open(output_dir / "val_probability_diagnostics.json", "w", encoding="utf-8") as f_out:
+        json.dump(best_val_diag, f_out, indent=2)
+
+    overlap = best_val_diag.get("overlap_coefficient") if isinstance(best_val_diag, dict) else None
+    if overlap is not None and overlap >= 0.70:
+        print(
+            "[diagnostic] Validation class-probability overlap is high. "
+            "Prioritize better event labels, higher-quality intraday data (avoid daily fallback), "
+            "and richer microstructure features before more architecture changes."
+        )
+
+    return {
+        "history": history,
+        "best": best,
+        "pos_weight": float(pos_weight.item()),
+        "val_probability_diagnostics": best_val_diag,
+    }
 
 
 def evaluate_model(

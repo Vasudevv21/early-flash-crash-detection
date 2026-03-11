@@ -57,3 +57,18 @@ Then run:
 ```bash
 python flash_crash_system.py
 ```
+
+
+## Validation probability diagnostics
+
+Training now saves `val_probability_diagnostics.json` in each run directory. It contains:
+
+- class-wise probability summaries (mean/std/quantiles),
+- class-wise probability histograms for class `0` and class `1`,
+- overlap coefficient between class distributions.
+
+If overlap is high, prioritize:
+
+1. stronger event labeling logic,
+2. higher-quality intraday data (avoid daily fallback for early-warning experiments),
+3. richer microstructure features.
